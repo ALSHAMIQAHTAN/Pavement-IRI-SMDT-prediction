@@ -1,20 +1,31 @@
- 
-# ==============================================================================
-# 0. Paths -- edit only these two lines
-# ==============================================================================
-from pathlib import Path
+# =============================================================================
+# Parallel estimation  of IRI and SMTD on RIOHTrack data
+# Voting Tree-Ensemble Learning (VTL = RF + ET + HGB), random 70/30 split.
+#
+# Reproducibility script accompanying the manuscript.
+# - Single validation protocol: random 70/30 train/test split (random_state=42).
+# - Feature elimination is performed on the TRAINING partition only (no leakage).
+# - Figures are DISPLAYED (plt.show); nothing is written to disk.
+#
+# Usage:
+#   Put "Paper_Random_DualTarget_data.xlsx" in the same folder as this script
+#   (sheet "ML_Database") and run.  Requires: numpy, pandas, matplotlib,
+#   seaborn, scikit-learn, shap, openpyxl.
+# =============================================================================
 
-# Repository folder containing this Python file
-BASE_DIR = Path(__file__).resolve().parent
+# -----------------------------------------------------------------------------
+# 0. Settings LOCAL PATH
+#DATA_PATH = r"H:DualTarget_data.xlsx"
+# -----------------------------------------------------------------------------
+DATA_PATH = "DualTarget_data.xlsx"   # relative path (same folder)
+SHEET     = "ML_Database"
+TEST_SIZE = 0.30          # 70% train / 30% test
+SEED      = 42
 
-DATA_PATH = BASE_DIR / "DualTarget_data.xlsx"
-OUT_DIR = BASE_DIR / "Figures"
-
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-# ==============================================================================
+# -----------------------------------------------------------------------------
 # 1. Imports
-# ==============================================================================
-import os, warnings
+# -----------------------------------------------------------------------------
+import warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -25,366 +36,243 @@ import shap
 
 from sklearn.ensemble import (RandomForestRegressor, ExtraTreesRegressor,
                               HistGradientBoostingRegressor)
-from sklearn.feature_selection import VarianceThreshold
-from sklearn.model_selection import train_test_split
+from sklearn.feature_selection import RFECV, VarianceThreshold
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import mean_squared_error, r2_score
 
 plt.rcParams.update({
     "font.family": "DejaVu Serif", "font.size": 11,
     "axes.linewidth": 1.2, "axes.labelweight": "bold",
-    "axes.titleweight": "bold", "figure.dpi": 120, "savefig.dpi": 300,
-    "savefig.bbox": "tight", "pdf.fonttype": 42, "ps.fonttype": 42,
+    "axes.titleweight": "bold", "figure.dpi": 120,
 })
-#os.makedirs(OUT_DIR, exist_ok=True)
-def pdf(n): return os.path.join(OUT_DIR, f"{n}.pdf")
 
-# ==============================================================================
-# 2. Symbol map (data column name -> LaTeX symbol used in all figures)
-# ==============================================================================
-SYMBOL = {
-    "Cycle_Index":              r"$t$",
-    "Traffic_Load":             r"$N$",
-    "Avg_Air_Temp":             r"$T_a$",
-    "Surface_Temp":             r"$T_s$",
-    "Passing_Rate_4.75mm_pct":  r"$P_{4.75}$",
-    "Total_AC_Thickness_cm":    r"$H_{ac}$",
-    "Total_Structural_cm":      r"$H_{str}$",
-    "Weighted_Mean_Modulus":    r"$\bar{E}$",
-    "Target_IRI_m_per_km":      r"$y_{IRI}$",
-    "Target_SMTD_mm":           r"$y_{SMTD}$",
-}
-for i in range(1, 14):
-    SYMBOL[f"H{i}"] = f"$H_{{{i}}}$"
-    SYMBOL[f"E{i}"] = f"$E_{{{i}}}$"
-
-def sym(name):  return SYMBOL.get(name, name)
-def syms(names): return [SYMBOL.get(n, n) for n in names]
-
-# ==============================================================================
-# 3. Load data
-# ==============================================================================
+# -----------------------------------------------------------------------------
+# 2. Load data
+# -----------------------------------------------------------------------------
 print("=" * 70)
 print("STEP 1: Load data")
 print("=" * 70)
-df = pd.read_excel(DATA_PATH, sheet_name="ML_Database")
+df = pd.read_excel(DATA_PATH, sheet_name=SHEET)
 print(f"Loaded {len(df):,} rows x {df.shape[1]} columns")
 
 TARGETS = ["Target_IRI_m_per_km", "Target_SMTD_mm"]
+target_labels = {"Target_IRI_m_per_km": "IRI (m/km)",
+                 "Target_SMTD_mm": "SMTD (mm)"}
 
 H_COLS = [f"H{i}" for i in range(1, 14)]
 E_COLS = [f"E{i}" for i in range(1, 14)]
 BASE_PHYS = ["Cycle_Index", "Traffic_Load", "Avg_Air_Temp", "Surface_Temp",
              "Passing_Rate_4.75mm_pct", "Total_AC_Thickness_cm",
              "Total_Structural_cm", "Weighted_Mean_Modulus"]
-FEATURES_ALL = BASE_PHYS + H_COLS + E_COLS
+FEATURES_ALL = BASE_PHYS + H_COLS + E_COLS          # 8 + 13 + 13 = 34 candidates
 print(f"Candidate physical features: {len(FEATURES_ALL)}")
 
 df = df.dropna(subset=TARGETS).reset_index(drop=True)
-print(f"Rows after dropping missing targets: {len(df):,}")
+print(f"After dropping records with missing IRI/SMTD: {len(df):,} rows")
 
-# ==============================================================================
-# 4. Feature-elimination pipeline
-#    Stages A, B, C are 100% deterministic filters (kept for narrative).
-#    Stage D uses a FIXED list of 14 features - no more RFECV randomness.
-# ==============================================================================
-print("\n" + "=" * 70)
-print("STEP 2: Feature-elimination pipeline")
-print("=" * 70)
+n_nan = int(df[FEATURES_ALL].isna().sum().sum())
+if n_nan:
+    print(f"WARNING: {n_nan} missing feature values -> filled with column median")
+    df[FEATURES_ALL] = df[FEATURES_ALL].fillna(df[FEATURES_ALL].median())
 
-X_all = df[FEATURES_ALL].copy()
 Y_all = df[TARGETS].values
 
-vt = VarianceThreshold(0.0); vt.fit(X_all)
-const_cols = [c for c, k in zip(FEATURES_ALL, vt.get_support()) if not k]
-print(f"[A] variance   -> drop {len(const_cols)}: {const_cols}")
-after_A = [c for c in FEATURES_ALL if c not in const_cols]
+# -----------------------------------------------------------------------------
+# 3. Random 70/30 split (indices)
+# -----------------------------------------------------------------------------
+idx_all = np.arange(len(df))
+tr, te = train_test_split(idx_all, test_size=TEST_SIZE, random_state=SEED)
+print(f"Train: {len(tr):,} rows ({len(tr)/len(df):.0%})   "
+      f"Test: {len(te):,} rows ({len(te)/len(df):.0%})")
 
-sparse = [c for c in after_A if (X_all[c] == 0).mean() > 0.90]
-print(f"[B] >90% zeros -> drop {len(sparse)}: {sparse}")
-after_B = [c for c in after_A if c not in sparse]
+# -----------------------------------------------------------------------------
+# 4. Four-stage feature elimination  (TRAINING ROWS ONLY -> no test leakage)
+#    variance -> sparsity -> Spearman correlation -> RFECV (union of 2 targets)
+# -----------------------------------------------------------------------------
+def select_features(X_tr_df, Y_tr):
+    print("\n--- Feature elimination (training rows only) ---")
+    cols = list(X_tr_df.columns)
 
-# --- FIXED, DETERMINISTIC 14-feature list defined BEFORE Stage C so
-#     that the correlation filter cannot accidentally drop any of them ---
-FINAL_FEATURES = [
-    "Cycle_Index",              # t
-    "Traffic_Load",             # N
-    "Avg_Air_Temp",             # T_a
-    "Surface_Temp",             # T_s
-    "Passing_Rate_4.75mm_pct",  # P_{4.75}
-    "Total_AC_Thickness_cm",    # H_{ac}
-    "Weighted_Mean_Modulus",    # E_bar
-    "H3", "H5", "H7",           # H_3, H_5, H_7
-    "E1", "E3", "E5", "E7",     # E_1, E_3, E_5, E_7
-]
+    # A) zero-variance (constant) columns
+    vt = VarianceThreshold(0.0).fit(X_tr_df)
+    const_cols = [c for c, k in zip(cols, vt.get_support()) if not k]
+    print(f"[A] variance  -> drop {len(const_cols)}: {const_cols}")
+    after_A = [c for c in cols if c not in const_cols]
 
-# Stage C - correlation filter, but PROTECT features in FINAL_FEATURES so
-# the deterministic list is never accidentally dropped by a random pairwise ordering.
-corr = X_all[after_B].corr(method="spearman").abs()
-upper = corr.where(np.triu(np.ones_like(corr, dtype=bool), k=1))
-redundant = []
-for col in upper.columns:
-    if col in redundant: continue
-    partners = upper[col][upper[col] > 0.95].index.tolist()
-    for p in partners:
-        if p in redundant or p == col:  continue
-        if p in FINAL_FEATURES:         continue    # protected
-        redundant.append(p)
-print(f"[C] |rho|>0.95 -> drop {len(redundant)}: {redundant}")
-after_C = [c for c in after_B if c not in redundant]
-print(f"[D] Final deterministic list -> {len(FINAL_FEATURES)} features")
-print("     Symbols:", " ".join(sym(f) for f in FINAL_FEATURES))
+    # B) >90% zeros (sparse placeholder layers)
+    sparse = [c for c in after_A if (X_tr_df[c] == 0).mean() > 0.90]
+    print(f"[B] sparsity  -> drop {len(sparse)}: {sparse}")
+    after_B = [c for c in after_A if c not in sparse]
 
-# Sanity: every FINAL feature must have survived stages A/B/C
-missing = [f for f in FINAL_FEATURES if f not in after_C]
-if missing:
-    raise RuntimeError(f"FINAL_FEATURES contain columns dropped by A/B/C: {missing}")
+    # C) |Spearman rho| > 0.95 (redundant)
+    corr = X_tr_df[after_B].corr(method="spearman").abs()
+    upper = corr.where(np.triu(np.ones_like(corr, dtype=bool), k=1))
+    redundant = []
+    for col in upper.columns:
+        if col in redundant:
+            continue
+        for p in upper[col][upper[col] > 0.95].index:
+            if p not in redundant:
+                redundant.append(p)
+    print(f"[C] |rho|>0.95 -> drop {len(redundant)}: {redundant}")
+    after_C = [c for c in after_B if c not in redundant]
 
-# Save the elimination audit
-audit_rows = []
-for f in FEATURES_ALL:
-    if f in const_cols:       stage = "A: constant"
-    elif f in sparse:         stage = "B: >90% zeros"
-    elif f in redundant:      stage = "C: correlated"
-    elif f in FINAL_FEATURES: stage = "KEPT (final 14)"
-    else:                     stage = "D: dropped in final selection"
-    audit_rows.append({"Feature": f, "Symbol": sym(f).replace("$",""),
-                       "Stage": stage})
-pd.DataFrame(audit_rows).to_csv(
-    os.path.join(OUT_DIR, "feature_selection_audit.csv"), index=False)
+    # D) RFECV per target, union of the two selections
+    print(f"[D] RFECV per target starting from {len(after_C)} features")
+    cv = KFold(n_splits=5, shuffle=True, random_state=SEED)
+    Xd = X_tr_df[after_C].values
+    sel = {}
+    for ti, tn in enumerate(TARGETS):
+        est = RandomForestRegressor(n_estimators=200, max_depth=20,
+                                    min_samples_leaf=2, random_state=SEED, n_jobs=1)
+        s = RFECV(estimator=est, step=1, cv=cv, scoring="r2",
+                  min_features_to_select=5, n_jobs=-1)
+        s.fit(Xd, Y_tr[:, ti])
+        sel[tn] = [f for f, k in zip(after_C, s.support_) if k]
+        print(f"    {tn}: kept {len(sel[tn])}")
+    union = [c for c in after_C if c in set(sel[TARGETS[0]]) | set(sel[TARGETS[1]])]
+    print(f"Union (final retained): {len(union)} features -> {union}")
+    return union
 
-# ==============================================================================
-# 5. Fit VTL under random 80/20 split (per-target training)
-# ==============================================================================
-print("\n" + "=" * 70)
-print("STEP 3: Fit VTL (RF + ET + HGB) under random 80/20 split")
-print("=" * 70)
+UNION = select_features(df.loc[tr, FEATURES_ALL], Y_all[tr])
 
-X = df[FINAL_FEATURES].values
-Xtr, Xte, Ytr, Yte = train_test_split(X, Y_all, test_size=0.20, random_state=42)
-print(f"Train: {Xtr.shape[0]}, Test: {Xte.shape[0]}")
+# -----------------------------------------------------------------------------
+# 5. Fit base learners + equal-weight VTL ensemble
+# -----------------------------------------------------------------------------
+def build_models():
+    return {
+        "RF":  RandomForestRegressor(n_estimators=800, min_samples_leaf=1,
+                                     random_state=SEED, n_jobs=-1),
+        "ET":  ExtraTreesRegressor(n_estimators=800, min_samples_leaf=1,
+                                   random_state=SEED, n_jobs=-1),
+        "HGB": HistGradientBoostingRegressor(max_iter=1500, learning_rate=0.02,
+                                             max_depth=10, min_samples_leaf=3,
+                                             l2_regularization=0.05,
+                                             random_state=SEED),
+    }
 
-def per_target_train(name):
-    """Train a model separately per target; return dict of predictions."""
-    tr = np.zeros_like(Ytr); te = np.zeros_like(Yte)
-    fitted = []
-    for t_idx in range(2):
-        if name == "RF":
-            m = RandomForestRegressor(n_estimators=800, min_samples_leaf=1,
-                                       random_state=42, n_jobs=-1)
-        elif name == "ET":
-            m = ExtraTreesRegressor(n_estimators=800, min_samples_leaf=1,
-                                     random_state=42, n_jobs=-1)
-        else:
-            m = HistGradientBoostingRegressor(max_iter=1500, learning_rate=0.02,
-                                                max_depth=10, min_samples_leaf=3,
-                                                l2_regularization=0.05,
-                                                random_state=42)
-        m.fit(Xtr, Ytr[:, t_idx])
-        tr[:, t_idx] = m.predict(Xtr)
-        te[:, t_idx] = m.predict(Xte)
-        fitted.append(m)
-    return fitted, tr, te
-
-models = {}; preds_tr = {}; preds_te = {}
-for name in ["RF", "ET", "HGB"]:
-    models[name], preds_tr[name], preds_te[name] = per_target_train(name)
-
-# VTL ensemble
-preds_tr["VTL"] = np.mean(list(preds_tr.values()), axis=0)
-preds_te["VTL"] = np.mean([preds_te[k] for k in ["RF","ET","HGB"]], axis=0)
-
-# Metrics
-rows = []
-for mn in ["RF", "ET", "HGB", "VTL"]:
-    for t_idx, tn in enumerate(TARGETS):
-        for dset, y, yh in (("Train", Ytr[:, t_idx], preds_tr[mn][:, t_idx]),
-                            ("Test",  Yte[:, t_idx], preds_te[mn][:, t_idx])):
-            r = y - yh
+def train_and_score(Xtr, Xte, ytr, yte):
+    models = build_models()
+    for m in models.values():
+        m.fit(Xtr, ytr)
+    base = ["RF", "ET", "HGB"]
+    p_tr = {n: models[n].predict(Xtr) for n in base}
+    p_te = {n: models[n].predict(Xte) for n in base}
+    p_tr["VTL"] = np.mean([p_tr[n] for n in base], axis=0)
+    p_te["VTL"] = np.mean([p_te[n] for n in base], axis=0)
+    rows = []
+    for mn in base + ["VTL"]:
+        for dset, y, yh in (("Train", ytr, p_tr[mn]), ("Test", yte, p_te[mn])):
+            resid = y - yh
+            rel = np.abs(resid / np.maximum(np.abs(y), 1e-9))
             rows.append({
-                "target": tn, "symbol": sym(tn).replace("$",""),
                 "model": mn, "set": dset,
-                "R2":   r2_score(y, yh),
-                "RMSE": float(np.sqrt(np.mean(r ** 2))),
-                "MAE":  float(np.mean(np.abs(r))),
-                "MAPE_pct":     float(np.mean(np.abs(r / np.maximum(np.abs(y), 1e-9))) * 100),
-                "Within_15pct": float(np.mean(np.abs(r / np.maximum(np.abs(y), 1e-9)) <= 0.15) * 100),
+                "R2": r2_score(y, yh),
+                "RMSE": np.sqrt(np.mean(resid ** 2)),
+                "MAE": np.mean(np.abs(resid)),
+                "MAPE_pct": np.mean(rel) * 100,
+                "Within_15pct": np.mean(rel <= 0.15) * 100,
             })
-results = pd.DataFrame(rows)
-results.to_csv(os.path.join(OUT_DIR, "model_comparison_results.csv"), index=False)
+    return models, p_te, rows
 
-print("\nTEST-SET RESULTS SUMMARY")
-test_only = results[results["set"] == "Test"]
-piv = test_only.pivot_table(index="model", columns="symbol",
-                             values="R2").round(4)
-print(piv.to_string())
-
-# ==============================================================================
-# 6. Figures - Fig 07, 08, 09, 11, 12, 13, 14, 15, 16 (manuscript numbering)
-# ==============================================================================
 print("\n" + "=" * 70)
-print("STEP 4: Generate manuscript-numbered PDF figures")
+print("STEP 2: Fit VTL (RF + ET + HGB) per target - random 70/30")
 print("=" * 70)
 
-# ---------- Fig 07: Spearman correlation heatmap ----------
-sub = df[FINAL_FEATURES + TARGETS].copy()
-sub.columns = syms(FINAL_FEATURES) + syms(TARGETS)
-# strip $ signs for display in seaborn (which handles LaTeX poorly on axis)
-sub.columns = [c.replace("$","") for c in sub.columns]
-cm = sub.corr(method="spearman")
-fig, ax = plt.subplots(figsize=(10, 8))
-sns.heatmap(cm, annot=True, fmt=".2f", cmap="RdBu_r", vmin=-1, vmax=1,
-            cbar_kws={"label": "Spearman rho"}, annot_kws={"size": 8},
-            linewidths=0.3, linecolor="white", ax=ax)
-ax.set_title("Fig. 7  Spearman correlation - features & targets", weight="bold")
-plt.tight_layout(); plt.savefig(pdf("Fig07_correlation_heatmap")); plt.close()
+all_rows, preds = [], {}
+rf_models = {}
+Xtr, Xte = df.loc[tr, UNION].values, df.loc[te, UNION].values
+for ti, tn in enumerate(TARGETS):
+    models, p_te, rows = train_and_score(Xtr, Xte, Y_all[tr, ti], Y_all[te, ti])
+    for r in rows:
+        r["target"] = tn
+    all_rows.extend(rows)
+    preds[tn] = (Y_all[te, ti], p_te["VTL"])
+    rf_models[tn] = models["RF"]
 
-# ---------- Fig 08: Model comparison bars (test set) ----------
-metrics_show = ["R2", "RMSE", "MAE", "MAPE_pct"]
-fig, axes = plt.subplots(2, 2, figsize=(11, 8))
-for ax, m in zip(axes.ravel(), metrics_show):
-    d = test_only.pivot(index="model", columns="symbol", values=m)
-    d.plot(kind="bar", ax=ax, color=["#4C72B0", "#DD8452"], edgecolor="black")
-    ax.set_ylabel(m, weight="bold"); ax.set_xlabel("")
-    ax.tick_params(axis="x", rotation=15)
-    ax.grid(True, axis="y", ls=":", alpha=0.6)
-    ax.legend(title="", frameon=False)
-plt.suptitle("Fig. 8  Test-set performance across models and targets", weight="bold")
-plt.tight_layout(); plt.savefig(pdf("Fig08_model_comparison")); plt.close()
+results = pd.DataFrame(all_rows)
+test_only = results[results["set"] == "Test"]
+print("\nRESULTS SUMMARY (test set, R2):")
+print(test_only.pivot_table(index="model", columns="target",
+                            values="R2").round(4).to_string())
 
-# ---------- Fig 09: Parity plots (VTL, both targets) ----------
+# -----------------------------------------------------------------------------
+# 6. Figures (DISPLAYED only; nothing saved)
+# -----------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("STEP 3: Display figures")
+print("=" * 70)
+
+# Fig 7: correlation heatmap (training rows)
+sub = df.loc[tr, UNION + TARGETS].rename(
+    columns={"Target_IRI_m_per_km": "IRI", "Target_SMTD_mm": "SMTD"})
+fig, ax = plt.subplots(figsize=(11, 9))
+sns.heatmap(sub.corr(method="spearman"), cmap="RdBu_r", vmin=-1, vmax=1,
+            cbar_kws={"label": "Spearman rho"}, linewidths=0.3,
+            linecolor="white", ax=ax)
+ax.set_title("Spearman correlation - retained features & targets (train)")
+plt.tight_layout(); plt.show()
+
+# Fig 8: model comparison bar (test R2)
+fig, axes = plt.subplots(1, 2, figsize=(12, 5.5), sharey=True)
+ymin = max(0.0, test_only["R2"].min() - 0.05)
+for ax, tn in zip(axes, TARGETS):
+    piv = test_only[test_only["target"] == tn].set_index("model")["R2"]
+    piv = piv.loc[["RF", "ET", "HGB", "VTL"]]
+    piv.plot(kind="bar", ax=ax, color="#4C72B0", edgecolor="black", width=0.7)
+    ax.set_ylim(ymin, 1.02); ax.set_ylabel("Test R²")
+    ax.set_title(target_labels[tn]); ax.set_xlabel("")
+    ax.tick_params(axis="x", rotation=0)
+    for i, v in enumerate(piv.values):
+        ax.text(i, v + 0.004, f"{v:.3f}", ha="center", fontsize=9, weight="bold")
+plt.tight_layout(); plt.show()
+
+# Fig 9: parity plots
 fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
-for ax, t_idx, tn in zip(axes, [0, 1], TARGETS):
-    y = Yte[:, t_idx]; yh = preds_te["VTL"][:, t_idx]
+for ax, tn in zip(axes, TARGETS):
+    y, yh = preds[tn]
     r2 = r2_score(y, yh); rmse = np.sqrt(mean_squared_error(y, yh))
     ax.scatter(y, yh, color="#4C72B0", alpha=0.6, s=22, edgecolor="black", lw=0.4)
     lo, hi = min(y.min(), yh.min()), max(y.max(), yh.max())
     pad = 0.05 * (hi - lo); xs = np.linspace(lo, hi, 100)
-    ax.plot([lo-pad, hi+pad], [lo-pad, hi+pad], color="#C44E52", lw=1.5, label="1:1")
+    ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color="#C44E52", lw=1.5, label="1:1")
     ax.plot(xs, xs * 1.15, "--", color="grey", lw=0.9, label="±15%")
     ax.plot(xs, xs * 0.85, "--", color="grey", lw=0.9)
-    ax.set_xlabel(f"Observed {sym(tn)}")
-    ax.set_ylabel(f"Predicted {sym(tn)}")
-    ax.set_title(f"{sym(tn)}   $R^2$={r2:.3f}   RMSE={rmse:.3f}")
+    ax.set_xlabel(f"Observed {target_labels[tn]}")
+    ax.set_ylabel(f"Predicted {target_labels[tn]}")
+    ax.set_title(f"{target_labels[tn]}   $R^2$={r2:.3f}   RMSE={rmse:.3f}")
     ax.grid(True, ls=":", alpha=0.6); ax.legend(frameon=False, fontsize=9, loc="upper left")
-plt.suptitle("Fig. 9  VTL parity plots - random 80/20 test set", weight="bold", y=1.02)
-plt.tight_layout(); plt.savefig(pdf("Fig09_parity")); plt.close()
+plt.tight_layout(); plt.show()
 
-# ==============================================================================
-# 7. SHAP suite: Fig 11 (bar), 12 (beeswarm), 13 (heatmap), 14 (interaction), 15 (waterfall)
-# ==============================================================================
-print("\n" + "=" * 70)
-print("STEP 5: SHAP interpretability - Figs 11, 12, 13, 14, 15")
-print("=" * 70)
+# -----------------------------------------------------------------------------
+# 7. SHAP (RF component, held-out test samples)
+# -----------------------------------------------------------------------------
+print("STEP 4: SHAP on RF (per target)")
+X_te = df.loc[te, UNION].values
+for tn in TARGETS:
+    explainer = shap.TreeExplainer(rf_models[tn])
+    n = min(800, X_te.shape[0])
+    idx = np.random.RandomState(SEED).choice(X_te.shape[0], size=n, replace=False)
+    sv = explainer.shap_values(X_te[idx], check_additivity=False)
 
-FEATURE_SYMBOLS = [sym(f).replace("$","") for f in FINAL_FEATURES]
-
-for t_idx, tn in enumerate(TARGETS):
-    tsym = sym(tn).replace("$","")
-    fname_suffix = tn.replace("Target_", "").replace("_m_per_km","IRI").replace("_mm","SMTD")
-
-    # Use RF component for SHAP (TreeSHAP)
-    rf = models["RF"][t_idx]
-    explainer = shap.TreeExplainer(rf)
-    idx = np.random.RandomState(42).choice(Xtr.shape[0], size=min(1000, Xtr.shape[0]), replace=False)
-    X_sample = Xtr[idx]
-    sv = explainer.shap_values(X_sample)
-
-    # ---- Fig 11: Global SHAP importance (bar) ----
-    ser = pd.Series(np.abs(sv).mean(axis=0), index=FEATURE_SYMBOLS).sort_values(ascending=True)
+    # Fig 10: global SHAP bar
+    ser = pd.Series(np.abs(sv).mean(axis=0), index=UNION).sort_values().tail(15)
     plt.figure(figsize=(9, 6))
     plt.barh(ser.index, ser.values, color="#4C72B0", edgecolor="black")
-    plt.xlabel("Mean |SHAP| value")
-    plt.title(f"Fig. 11  Global SHAP importance - {tsym}", weight="bold")
+    plt.xlabel("Mean |SHAP|")
+    plt.title(f"Global SHAP importance - {target_labels[tn]}")
     plt.grid(True, axis="x", ls=":", alpha=0.6)
-    plt.tight_layout(); plt.savefig(pdf(f"Fig11_SHAP_bar_{fname_suffix}")); plt.close()
+    plt.tight_layout(); plt.show()
 
-    # ---- Fig 12: SHAP beeswarm ----
+    # Fig 11: SHAP beeswarm
     plt.figure(figsize=(9, 7))
-    shap.summary_plot(sv, X_sample, feature_names=FEATURE_SYMBOLS,
-                      max_display=14, show=False)
-    plt.title(f"Fig. 12  SHAP beeswarm - {tsym}", weight="bold")
-    plt.tight_layout(); plt.savefig(pdf(f"Fig12_SHAP_beeswarm_{fname_suffix}")); plt.close()
+    shap.summary_plot(sv, X_te[idx], feature_names=UNION, max_display=15, show=False)
+    plt.title(f"SHAP beeswarm - {target_labels[tn]}")
+    plt.tight_layout(); plt.show()
 
-    # ---- Fig 13: SHAP heatmap (observations x features) ----
-    # Sort observations by predicted y so that trends are visible
-    order = np.argsort(rf.predict(X_sample))
-    fig, ax = plt.subplots(figsize=(10, 6))
-    im = ax.imshow(sv[order].T, cmap="RdBu_r", aspect="auto",
-                    vmin=-np.abs(sv).max()*0.8, vmax=np.abs(sv).max()*0.8)
-    ax.set_yticks(range(len(FEATURE_SYMBOLS)))
-    ax.set_yticklabels(FEATURE_SYMBOLS)
-    ax.set_xlabel("Training observation (sorted by predicted value)")
-    ax.set_title(f"Fig. 13  SHAP heatmap across observations - {tsym}", weight="bold")
-    plt.colorbar(im, ax=ax, label="SHAP value")
-    plt.tight_layout(); plt.savefig(pdf(f"Fig13_SHAP_heatmap_{fname_suffix}")); plt.close()
-
-    # ---- Fig 14: SHAP interaction heatmap (feature x feature) ----
-    # Use smaller sample for interactions (expensive computation)
-    idx2 = np.random.RandomState(42).choice(Xtr.shape[0], size=min(300, Xtr.shape[0]), replace=False)
-    try:
-        siv = explainer.shap_interaction_values(Xtr[idx2])
-        mean_abs_iv = np.abs(siv).mean(axis=0)
-        # Zero diagonal so off-diagonal interactions dominate
-        np.fill_diagonal(mean_abs_iv, 0)
-        fig, ax = plt.subplots(figsize=(9, 7.5))
-        sns.heatmap(mean_abs_iv, annot=False, cmap="Reds",
-                     xticklabels=FEATURE_SYMBOLS,
-                     yticklabels=FEATURE_SYMBOLS,
-                     cbar_kws={"label": "Mean |SHAP interaction|"},
-                     linewidths=0.3, linecolor="white", ax=ax)
-        ax.set_title(f"Fig. 14  SHAP interaction map - {tsym}", weight="bold")
-        plt.tight_layout(); plt.savefig(pdf(f"Fig14_SHAP_interaction_{fname_suffix}")); plt.close()
-    except Exception as e:
-        print(f"    Fig 14 skipped for {tn}: {e}")
-
-    # ---- Fig 15: SHAP waterfall for a median-error test observation ----
-    yh_te = models["RF"][t_idx].predict(Xte)
-    y_te = Yte[:, t_idx]
-    err_order = np.argsort(np.abs(yh_te - y_te))
-    median_idx = err_order[len(err_order) // 2]
-    single_x = Xte[median_idx:median_idx+1]
-    sv_single = explainer.shap_values(single_x)[0]
-    base_val = explainer.expected_value
-    if hasattr(base_val, "__len__"):
-        base_val = base_val[0]
-    expl = shap.Explanation(
-        values=sv_single,
-        base_values=base_val,
-        data=single_x[0],
-        feature_names=FEATURE_SYMBOLS,
-    )
-    plt.figure(figsize=(9, 6.5))
-    shap.plots.waterfall(expl, max_display=14, show=False)
-    plt.title(f"Fig. 15  SHAP waterfall (median-error test point) - {tsym}", weight="bold")
-    plt.tight_layout(); plt.savefig(pdf(f"Fig15_SHAP_waterfall_{fname_suffix}")); plt.close()
-
-# ==============================================================================
-# 8. Fig 16: Residual vs observed
-# ==============================================================================
-fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-for ax, t_idx, tn, lbl in zip(axes, [0, 1], TARGETS, ["(a)", "(b)"]):
-    y = Yte[:, t_idx]; yh = preds_te["VTL"][:, t_idx]; r = yh - y
-    hb = ax.hexbin(y, r, gridsize=25, cmap="Reds", mincnt=1)
-    ax.axhline(0, color="black", lw=1)
-    xs = np.linspace(y.min(), y.max(), 100)
-    ax.plot(xs,  0.15 * xs, "--", color="grey", lw=1.1, label="±15% of observed")
-    ax.plot(xs, -0.15 * xs, "--", color="grey", lw=1.1)
-    ax.set_xlabel(f"Observed {sym(tn)}"); ax.set_ylabel("Residual")
-    ax.set_title(f"{lbl} {sym(tn)}")
-    plt.colorbar(hb, ax=ax, label="Point density")
-    ax.legend(frameon=False, fontsize=8, loc="upper right")
-plt.suptitle("Fig. 16  Residual (Predicted - Observed) vs observed - test set", weight="bold")
-plt.tight_layout(); plt.savefig(pdf("Fig16_residual_vs_observed")); plt.close()
-
-# ==============================================================================
-# 9. Headline
-# ==============================================================================
 print("\n" + "=" * 70)
-print("HEADLINE RESULTS (VTL, random 80/20 test set)")
+print("HEADLINE RESULTS (VTL, test set)")
 print("=" * 70)
-r = results[(results["set"] == "Test") & (results["model"] == "VTL")]
-for _, row in r.iterrows():
-    star = " *" if row["R2"] >= 0.95 else ""
-    print(f"  {row['symbol']:8s}  R2 = {row['R2']:.4f}  RMSE = {row['RMSE']:.4f}  Within +/-15%: {row['Within_15pct']:.1f}%{star}")
-print(f"\nAll outputs in:  {OUT_DIR}")
-print(f"Deterministic run: FINAL_FEATURES has exactly {len(FINAL_FEATURES)} entries.")
+for _, row in test_only[test_only["model"] == "VTL"].iterrows():
+    print(f"  {row['target'][:20]:20s} | R2 = {row['R2']:.4f} | "
+          f"RMSE = {row['RMSE']:.4f} | within +/-15% = {row['Within_15pct']:.1f}%")
